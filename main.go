@@ -3,52 +3,67 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/chromedp"
 )
 
-const DOWNLOAD_PAGE = `<!DOCTYPE html>
+const PAGE_A = `<!DOCTYPE html>
 <html lang="en-US">
 
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width" />
-    <title>Downloads Testpage</title>
+    <title>Page A Testpage</title>
 </head>
 
 <body>
-    <button id="download">Download</button>
-    <script>
-        document.getElementById("download").addEventListener("click", () => {
-            let anchor = document.createElement('a');
-            anchor.setAttribute('href', 'data:text/plain;charset=utf-8,CONTENT');
-            anchor.setAttribute('download', 'file.txt');
-            anchor.click()
-        })
-    </script>
+	<a href="/page-B" target="_blank" id="open">Open in New Tab</a>
 </body>
 </html>`
 
-func page(w http.ResponseWriter, req *http.Request) {
-	fmt.Fprintf(w, DOWNLOAD_PAGE)
+const PAGE_B = `<!DOCTYPE html>
+<html lang="en-US">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <title>Page B Testpage</title>
+</head>
+
+<body>
+	Hi!
+</body>
+</html>`
+
+func pageA(w http.ResponseWriter, req *http.Request) {
+	fmt.Fprintf(w, PAGE_A)
+}
+func pageB(w http.ResponseWriter, req *http.Request) {
+	fmt.Fprintf(w, PAGE_B)
 }
 
 func startServer() {
-	http.HandleFunc("/page", page)
+	http.HandleFunc("/page-A", pageA)
+	http.HandleFunc("/page-B", pageB)
 	go http.ListenAndServe(":8080", nil)
+}
+
+func printTab(msg string, tab context.Context) {
+	var title string
+	chromedp.Run(tab, chromedp.Title(&title))
+	ctx := chromedp.FromContext(tab)
+	fmt.Printf("%s - %s | ID:%s | Browser ID: %s\n", msg, title, ctx.Target.TargetID, ctx.BrowserContextID)
 }
 
 func main() {
 	startServer()
 
 	// first we start up a browser instance and grab its websocket url
-	fmt.Print("+++ SPINNING UP THE BROWSER\n\n")
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.UserDataDir("./"),
 	)
@@ -62,81 +77,55 @@ func main() {
 	components := strings.Split(string(bs), "\n")
 	wsURL := fmt.Sprintf("ws://127.0.0.1:%s%s", components[0], components[1])
 
-	//now we attach to the browser twice
-	allocCtxA, canceldAlloCtxA := chromedp.NewRemoteAllocator(context.Background(), wsURL)
-	defer canceldAlloCtxA()
-	allocCtxB, canceldAlloCtxB := chromedp.NewRemoteAllocator(context.Background(), wsURL)
-	defer canceldAlloCtxB()
+	//now we attach to the browser
+	allocCtx, cancelAlloCtx := chromedp.NewRemoteAllocator(context.Background(), wsURL)
+	defer cancelAlloCtx()
 
-	//we create a new tab on A
-	fmt.Print("+++ CREATING FIRST TAB\n\n")
-	tabA, cancelA := chromedp.NewContext(allocCtxA, chromedp.WithDebugf(log.Printf))
-	defer cancelA()
+	//we create a couple of new tabs:
+	firstTab, cancelFirst := chromedp.NewContext(allocCtx, chromedp.WithNewBrowserContext())
+	defer cancelFirst()
+	chromedp.Run(firstTab, chromedp.Evaluate("1", nil))
 
-	//and configure it for downloads
-	fmt.Print("+++ CONFIGURING FIRST TAB DOWNLOAD BEHAVIOR\n\n")
-	chromedp.Run(tabA, browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllowAndName).
-		WithDownloadPath("./").
-		WithEventsEnabled(true))
+	secondTab, cancelSecond := chromedp.NewContext(firstTab, chromedp.WithNewBrowserContext())
+	defer cancelSecond()
+	chromedp.Run(secondTab, chromedp.Evaluate("1", nil))
 
-	downloads := make(chan string, 1)
-	chromedp.ListenTarget(tabA, func(ev interface{}) {
-		switch ev := ev.(type) {
-		case *browser.EventDownloadWillBegin:
-			fmt.Print("\n+++ DOWNLOAD BEGIN\n\n")
-		case *browser.EventDownloadProgress:
-			switch ev.State {
-			case browser.DownloadProgressStateCanceled:
-				fmt.Print("\n+++ DOWNLOAD CANCELED\n\n")
-				downloads <- "CANCELED"
-			case browser.DownloadProgressStateCompleted:
-				fmt.Print("\n+++ DOWNLOAD COMPLETE\n\n")
-				content, _ := os.ReadFile("./" + ev.GUID)
-				downloads <- "COMPLETE: " + string(content)
-			}
-		}
-	})
+	printTab("First Tab", firstTab)
+	printTab("Second Tab", secondTab)
 
-	//and we try downloading something
-	fmt.Print("\n+++ LOADING PAGE AND PERFORMING FIRST DOWNLOAD\n\n")
-	chromedp.Run(tabA,
-		chromedp.Navigate(`http://localhost:8080/page`),
+	firstTabId := chromedp.FromContext(firstTab).Target.TargetID
+
+	// now we open a new tab from the first tab
+	chromedp.Run(firstTab,
+		chromedp.Navigate(`http://localhost:8080/page-A`),
 		chromedp.WaitVisible(`body`),
-		chromedp.Click(`#download`, chromedp.NodeVisible),
+		chromedp.Click(`#open`, chromedp.NodeVisible),
 	)
-	firstDownload := <-downloads
+	time.Sleep(time.Second)
+	var newTab context.Context
+	var cancel context.CancelFunc
+	targets, _ := chromedp.Targets(firstTab)
+	for _, target := range targets {
+		if target.OpenerID == firstTabId {
+			newTab, cancel = chromedp.NewContext(firstTab, chromedp.WithTargetID(target.TargetID))
+		}
+	}
+	printTab("New Tab (context based off of firstTab)", newTab)
+	cancel()
 
-	//and we do it again, to prove that we can
-	fmt.Print("+++ PERFORMING SECOND DOWNLOAD\n\n")
-	chromedp.Run(tabA, chromedp.Click(`#download`, chromedp.NodeVisible))
-	secondDownload := <-downloads
-
-	//now we create a new tab in the separate remote allocator
-	fmt.Print("+++ CREATING NEW TAB\n\n")
-	tabB, cancelB := chromedp.NewContext(allocCtxB, chromedp.WithDebugf(log.Printf))
-
-	//and we configure it for downloads
-	fmt.Print("+++ CONFIGURING NEW TAB DOWNLOAD BEHAVIOR\n\n")
-	chromedp.Run(tabB, browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllowAndName).
-		WithDownloadPath("./").
-		WithEventsEnabled(true))
-
-	// back on tabA, we try another download
-	fmt.Print("\n+++ PERFORMING THIRD DOWNLOAD (ON ORIGINAL TAB)\n\n")
-	chromedp.Run(tabA, chromedp.Click(`#download`, chromedp.NodeVisible))
-	thirdDownload := <-downloads
-
-	// now we close tab B
-	fmt.Print("+++ CLOSING NEW TAB\n\n")
-	cancelB()
-
-	// and try one last download on tab A
-	fmt.Print("\n+++ PERFORMING FOURTH DOWNLOAD (ON ORIGINAL TAB)\n\n")
-	chromedp.Run(tabA, chromedp.Click(`#download`, chromedp.NodeVisible))
-	fourthDownload := <-downloads
-
-	fmt.Printf("+++ DOWNLOAD #1: EXPECTED 'COMPLETE: CONTENT', GOT '%s'\n", firstDownload)  // this is fine
-	fmt.Printf("+++ DOWNLOAD #2: EXPECTED 'COMPLETE: CONTENT', GOT '%s'\n", secondDownload) // this is fine
-	fmt.Printf("+++ DOWNLOAD #3: EXPECTED 'COMPLETE: CONTENT', GOT '%s'\n", thirdDownload)  // this is fine
-	fmt.Printf("+++ DOWNLOAD #4: EXPECTED 'COMPLETE: CONTENT', GOT '%s'\n", fourthDownload) // this... is not fine - it shows CANCELED
+	//do it again
+	chromedp.Run(firstTab,
+		chromedp.Navigate(`http://localhost:8080/page-A`),
+		chromedp.WaitVisible(`body`),
+		chromedp.Click(`#open`, chromedp.NodeVisible),
+	)
+	time.Sleep(time.Second)
+	targets, _ = chromedp.Targets(firstTab)
+	for _, target := range targets {
+		if target.OpenerID == firstTabId {
+			newTab, cancel = chromedp.NewContext(secondTab, chromedp.WithTargetID(target.TargetID)) //this time attach to the secondTab
+		}
+	}
+	printTab("New Tab (context based off of secondTab)", newTab)
+	cancel()
 }
